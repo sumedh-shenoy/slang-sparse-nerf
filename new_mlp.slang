@@ -12,15 +12,15 @@ struct mlp_gradients {
 
 
 [BackwardDifferentiable]
-float compute_linear_pass(float [max_size] input, TensorView<float> weight, TensorView<float> bias, TensorView<float> input_gradient, TensorView<float> weight_gradient, TensorView<float> bias_gradient, uint2 location) {
+float compute_linear_pass(float [max_size] input, TensorView<float> weight, TensorView<float> bias, TensorView<float> weight_gradient, TensorView<float> bias_gradient, uint2 location) {
     float sum_value = 0.0;
     uint batch = location.x;
     uint pos = location.y;
+    uint height = weight.size(0);
 
-    if (pos > weight.size(1))
+    if (pos > weight.size(1) || pos < 0 || height > max_size || height < 0)
         return 0;
 
-    uint height = weight.size(0);
     [MaxIters(max_size)]
     for (int i = 0; i < height; i++) {
         sum_value = sum_value + input[i] * get_weight_val(weight, weight_gradient, uint2(i, pos)) + get_bias_val(bias, bias_gradient, pos);
@@ -30,30 +30,32 @@ float compute_linear_pass(float [max_size] input, TensorView<float> weight, Tens
 }
 
 [BackwardDifferentiable]
-float compute_activation(float val, no_diff int activation_type) {
+float compute_activation(float val, int activation_type) {
     if (activation_type == 0) {
         // type 0: Identity
         return val;
     } else if (activation_type == 1) {
         // type 1: ReLU
         return max(val, 0);
-    } else if (activation_type == 2) {
-        // type 2: Sigmoid
     }
     return 0;
 }
 
 [BackwardDifferentiable]
 float_arr mlp_compute_forward(TensorView<float> input, TensorView<float> weights[num_layers], TensorView<float> bias[num_layers], TensorView<float> input_gradient,
-    TensorView<float> weight_gradients[num_layers], TensorView<float> bias_gradients[num_layers], no_diff int activation_type[num_layers], no_diff uint batch) {
+    TensorView<float> weight_gradients[num_layers], TensorView<float> bias_gradients[num_layers], int activation_type[num_layers], no_diff uint batch) {
 
-    uint input_size = input.size(1);
-    float input_layer[max_size];
-    float output_layer[max_size];
+    if (batch > input.size(0)) {
+        float_arr dummy_val;
+        return dummy_val;
+    }
+
+    uint input_size = weights[0].size(0);
+    float input_layer[num_layers+1][max_size];
 
     [MaxIters(max_size)]
     for (int i = 0; i < input_size; i++) {
-        input_layer[i] = get_input_val(input, input_gradient, uint2(batch, i));
+        input_layer[0][i] = get_input_val(input, input_gradient, uint2(batch, i));
     }
     
     [MaxIters(num_layers)]
@@ -61,12 +63,8 @@ float_arr mlp_compute_forward(TensorView<float> input, TensorView<float> weights
         uint next_height = weights[i].size(1);
         [MaxIters(max_size)]
         for (int j = 0; j < next_height; j++) {
-            output_layer[j] = compute_linear_pass(input_layer, weights[i], bias[i], input_gradient, weight_gradients[i], bias_gradients[i], uint2(batch, j));
-            output_layer[j] = compute_activation(output_layer[j], activation_type[i]);
-        }
-        [MaxIters(max_size)]
-        for (int j = 0; j < max_size; j++) {
-            input_layer[j] = output_layer[j];
+            input_layer[i + 1][j] = compute_linear_pass(input_layer[i], weights[i], bias[i], weight_gradients[i], bias_gradients[i], uint2(batch, j));
+            input_layer[i + 1][j] = compute_activation(input_layer[i+1][j], activation_type[i]);
         }
     }
     
@@ -74,7 +72,7 @@ float_arr mlp_compute_forward(TensorView<float> input, TensorView<float> weights
 
     [MaxIters(output_size)]
     for (int i = 0; i < output_size; i++) {
-        output_val.vals[i] = output_layer[i];
+        output_val.vals[i] = input_layer[num_layers][i];
     }
     return output_val;
 }
@@ -126,6 +124,8 @@ void mlp_bwd_kernel(TensorView<float> input, TensorView<float> weights[num_layer
 
     uint batch = (cudaBlockDim() * cudaBlockIdx() + cudaThreadIdx()).x;
     float_arr.Differential res;
+    if (batch >= input.size(0))
+        return;
     for (int i = 0; i < output_size; i++) {
         res.vals[i] = result_gradients[uint2(batch, i)];
     }
@@ -154,7 +154,7 @@ TorchTensor<float> mlp_fwd(TorchTensor<float> input, TorchTensor<float> weights[
 
     uint batches = input.size(0);
     var output = TorchTensor<float>.alloc(batches, output_size);
-    let blockCount = uint3(2);
+    let blockCount = uint3(1);
     let groupSize = uint3(batches, 1, 1);
     __dispatch_kernel(mlp_fwd_kernel, blockCount, groupSize)(input, weight_views, bias_views, output, input_gradient, weight_gradient_views, bias_gradient_views, activation_type);
     return output;
@@ -169,7 +169,7 @@ mlp_gradients mlp_bwd(TorchTensor<float> input, TorchTensor<float> weights[num_l
     TorchTensor<float> bias_gradients[num_layers];
     TensorView<float> weight_gradient_views[num_layers];
     TensorView<float> bias_gradient_views[num_layers];
-
+    
     [MaxIters(num_layers)]
     for (int i = 0; i < num_layers; i++) {
         weight_views[i] = weights[i].getView();
@@ -179,9 +179,9 @@ mlp_gradients mlp_bwd(TorchTensor<float> input, TorchTensor<float> weights[num_l
         weight_gradient_views[i] = weight_gradients[i].getView();
         bias_gradient_views[i] = bias_gradients[i].getView();
     }
-
+    
     uint batches = input.size(0);
-    let blockCount = uint3(2);
+    let blockCount = uint3(1);
     let groupSize = uint3(batches, 1, 1);
     __dispatch_kernel(mlp_bwd_kernel, blockCount, groupSize)(input, weight_views, bias_views, input_gradient, weight_gradient_views, bias_gradient_views, activation_type, result_gradients);
     mlp_gradients res;
