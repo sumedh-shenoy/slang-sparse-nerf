@@ -20,7 +20,6 @@ result_arr mlp_forward(TensorView<float> input, TensorView<float> weight [num_la
     TensorView<float> weight_gradient [num_layers], TensorView<float> bias_gradient [num_layers], no_diff int activation [num_layers], no_diff uint batch, no_diff uint layer) {
     
     result_arr output = linear_layer_tensor(input, weight[0], bias[0], input_gradient, weight_gradient[0], bias_gradient[0], activation[0], batch);
-    output = linear_layer_norm(output, weight[1], bias[1], weight_gradient[1], bias_gradient[1], activation[1]);
     [MaxIters(num_layers-1)]
     for(int i = 1; i < num_layers; i++) {
         output = linear_layer_norm(output, weight[i], bias[i], weight_gradient[i], bias_gradient[i], activation[i]);
