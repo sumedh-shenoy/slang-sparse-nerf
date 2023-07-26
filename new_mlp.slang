@@ -1,4 +1,4 @@
-#define max_size 64
+#define max_size 32
 #define output_size 3
 #define num_layers 3
 
