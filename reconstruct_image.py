@@ -6,19 +6,66 @@ import os
 import sys
 import time
 
-from torchvision.io import read_image, write_png, image
+from common import read_image, write_image
 
 image_name = "test_6x8.png"
 image_file = "data/images/" + image_name
-reconstructed_file = "/data/outputs/" + image_name
+result_filename = "data/outputs/" + image_name
+reconstructed_file2 = "data/outputs/t_" + image_name
 
 mlp_num_layers = 3
 output_size = 3
-num_features = 4
-rescale_factor = 4
+n_levels = 16
+n_features = 2
+per_level_scale = 2.0
+hashmap_size = 1 << 17
+base_resolution = 16
 
-mlp_construction = slangpy.loadModule("mlp.slang", defines={"max_size": 32, "output_size": output_size, "num_layers": mlp_num_layers})
-encoding = slangpy.loadModule("feature_encoding.slang")
+full_fused = slangpy.loadModule("fully_fused_mlp_2d.slang")
+mlp_construction = slangpy.loadModule("mlp.slang")
+
+class mlp_hash_encoding(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, activation_layers, input, encoding, *weights):
+        ctx.save_for_backward(input, encoding, *weights)
+
+        weight = weights[:mlp_num_layers]
+        bias = weights[mlp_num_layers:]
+        ctx.activations = activation_layers
+
+        value = full_fused.mlp_fwd(input, encoding, weight, bias, activation_layers)
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        parameters = ctx.saved_tensors
+        activations = ctx.activations
+
+        input = parameters[0]
+        encoding = parameters[1]
+        weight = parameters[2:2 + mlp_num_layers]
+        bias = parameters[2 + mlp_num_layers:]
+
+        gradients = full_fused.mlp_bwd(input, encoding, weight, bias, activations, grad_out)
+        return None, *gradients[0]
+
+class fully_fused_mlp(torch.nn.Module):
+    def __init__(self, n_neurons, activations):
+        super(fully_fused_mlp, self).__init__()
+        self.fn = mlp_hash_encoding.apply
+
+        if n_neurons[0] != n_levels * n_features or n_neurons[mlp_num_layers] != output_size:
+            raise ValueError
+
+        self.activations = activations
+        encoding = torch.nn.Parameter((torch.rand(hashmap_size, n_levels, n_features) * 2 / 10**4 - 1/ 10**4).to(device='cuda:0'))
+        weights =  [torch.nn.Parameter((torch.rand(n_neurons[i], n_neurons[i+1]) * 2 / math.sqrt(n_neurons[i]) - 1 / math.sqrt(n_neurons[i])).to(device='cuda:0')) for i in range(mlp_num_layers)]
+        biases = [torch.nn.Parameter((torch.rand(n_neurons[i+1],) * 2 / math.sqrt(n_neurons[i]) - 1 / math.sqrt(n_neurons[i])).to(device='cuda:0')) for i in range(mlp_num_layers)]
+
+        self.params = torch.nn.ParameterList([encoding, *weights, *biases])
+
+    def forward(self, x):
+        return self.fn(self.activations, x, self.params[0], *self.params[1:])
 
 class custom_mlp(torch.autograd.Function):
     @staticmethod
@@ -43,29 +90,28 @@ class custom_mlp(torch.autograd.Function):
         bias = vals[(1 + mlp_num_layers):(1 + 2*mlp_num_layers)]
 
         ret = mlp_construction.mlp_bwd(input, weights, bias, activations, grad_out)
-        return None, ret[0], *ret[1], *ret[2]
+        return None, *ret[0]
 
-class sample_feature_grid(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, feature_grid, location):
-        ctx.save_for_backward(feature_grid, location)
-        return encoding.feature_encoding_fwd(feature_grid, location)
+class mlp(torch.nn.Module):
+    def __init__(self, size_ins, activations):
+        super(mlp, self).__init__()
+        self.fn = custom_mlp.apply
+        size_ins.append(output_size)
 
-    @staticmethod
-    def backward(ctx, grad_out):
-        [feature_grid, location] = ctx.saved_tensors
-        feature_gradient = encoding.feature_encoding_bwd(feature_grid, location, grad_out)
-        return feature_gradient, None
+        self.activations = activations
+        self.weights = torch.nn.ParameterList([torch.nn.Parameter((torch.rand(size_ins[i], size_ins[i+1]) * 2 / math.sqrt(size_ins[i]) - 1 / math.sqrt(size_ins[i])).to(device='cuda:0')) for i in range(mlp_num_layers)])
+        self.biases = torch.nn.ParameterList([torch.nn.Parameter((torch.rand(size_ins[i+1],) * 2 / math.sqrt(size_ins[i]) - 1 / math.sqrt(size_ins[i])).to(device='cuda:0')) for i in range(mlp_num_layers)])
+        self.all_weights = torch.nn.ParameterList([*self.weights, *self.biases])
 
-"""
-Simple image sampling module, taken from tiny-cuda-nn sample code. 
-"""
+    def forward(self, x):
+        return self.fn(self.activations, x, *self.all_weights)
+
 class Image(torch.nn.Module):
 	def __init__(self, filename, device):
 		super(Image, self).__init__()
-		self.data = read_image(filename, mode=image.ImageReadMode.RGB).to(device=device)
-		self.data = torch.transpose(self.data, 0, 2)
-		self.shape = self.data.size()
+		self.data = read_image(filename)
+		self.shape = self.data.shape
+		self.data = torch.from_numpy(self.data).float().to(device)
 
 	def forward(self, xs):
 		with torch.no_grad():
@@ -89,114 +135,99 @@ class Image(torch.nn.Module):
 				self.data[y1, x1] * lerp_weights[:,0:1] * lerp_weights[:,1:2]
 			)
 
-class mlp(torch.nn.Module):
-    def __init__(self, size_ins, activations):
-        super(mlp, self).__init__()
-        self.fn = custom_mlp.apply
-        size_ins.append(output_size)
-
-        self.activations = activations
-        self.weights = torch.nn.ParameterList([torch.nn.Parameter(torch.randn(size_ins[i], size_ins[i+1]).to(device='cuda:0')) for i in range(mlp_num_layers)])
-        self.biases = torch.nn.ParameterList([torch.nn.Parameter(torch.randn(size_ins[i+1],).to(device='cuda:0')) for i in range(mlp_num_layers)])
-        self.all_weights = torch.nn.ParameterList([*self.weights, *self.biases])
-
-    def forward(self, x):
-        return self.fn(self.activations, x, *self.all_weights)
-
-class feature_encoding(torch.nn.Module):
-    def __init__(self, image_size):
-        super(feature_encoding, self).__init__()
-        image_size[0] = math.ceil(image_size[0]/rescale_factor)
-        image_size[1] = math.ceil(image_size[1]/rescale_factor)
-
-        self.fn = sample_feature_grid.apply
-        self.feature_grid = torch.nn.Parameter(torch.randn(image_size[0], image_size[1], num_features).to(device='cuda:0'))
-    
-    def forward(self, location):
-        return self.fn(self.feature_grid, location)
 
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     device = 'cuda:0'
-    img = Image(image_file, device)
+    print(hashmap_size)
+    image = Image(image_file, device)
+    print(image.shape)
 
-    # Variables for saving results
+    n_channels = image.shape[2]
+    # model = fully_fused_mlp([32, 64, 64, 3], [1, 1, 1])
+    model = torch.nn.Sequential(torch.nn.Linear(2, 64).to(device='cuda:0'), torch.nn.ReLU(), torch.nn.Linear(64, 64).to(device='cuda:0'), torch.nn.ReLU(), torch.nn.Linear(64, 3).to(device='cuda:0'), torch.nn.ReLU())
+    model = mlp([2, 64, 64], [0, 0, 0])
 
-    
-    im_width = img.shape[0]
-    im_height = img.shape[1]
-    
-    im_shape = [3, im_height, im_width]
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
-    xs = torch.linspace(0.5, im_width-0.5, im_width)
-    ys = torch.linspace(0.5, im_height-0.5, im_height)
+	# Variables for saving/displaying image results
+    resolution = image.data.shape[0:2]
+    img_shape = resolution + torch.Size([image.data.shape[2]])
+    n_pixels = resolution[0] * resolution[1]
+
+    half_dx =  0.5 / resolution[0]
+    half_dy =  0.5 / resolution[1]
+    xs = torch.linspace(half_dx, 1-half_dx, resolution[0], device=device)
+    ys = torch.linspace(half_dy, 1-half_dy, resolution[1], device=device)
     xv, yv = torch.meshgrid([xs, ys])
 
-    xy = torch.stack((xv.flatten(), yv.flatten())).t().to(device=device)
+    xy = torch.stack((yv.flatten(), xv.flatten())).t()
 
-    learning_rate = 0.01
-    
-    model = torch.nn.Sequential(feature_encoding([im_width, im_height]), mlp([4, 32, 32], [1, 1, 1]))
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    num_steps = 5
-    batch_size = 1
-    batch = torch.rand([batch_size, 2], device=device, dtype=torch.float32)
-    print(img(batch))
-    
+    path = f"data/reference.jpg"
+    print(f"Writing '{path}'... ", end="")
+    # model(xy)
+    write_image(path, image(xy).reshape(img_shape).detach().cpu().numpy())
+    print("done.")
 
     prev_time = time.perf_counter()
-    
-    for i in range(num_steps):
+
+    batch_size = 2**18
+    interval = 20
+    interval_mid = 10
+
+    n_steps = interval + 1
+
+    print(f"Beginning optimization with {n_steps} training steps.")
+
+    try:
         batch = torch.rand([batch_size, 2], device=device, dtype=torch.float32)
-        targets = img(batch)
+        traced_image = torch.jit.trace(image, batch)
+    except:
+        # If tracing causes an error, fall back to regular execution
+        print(f"WARNING: PyTorch JIT trace failed. Performance will be slightly worse than regular.")
+        traced_image = image
+
+    for i in range(n_steps):
+        batch = torch.rand([batch_size, 2], device=device, dtype=torch.float32)
+        targets = traced_image(batch)
         output = model(batch)
 
-        loss_fn = torch.nn.MSELoss()
-        loss = loss_fn(output, targets)
-        print(loss)
-        print("we output", output)
-        print("we seek", targets)
-
+        
+        relative_l2_error = (output - targets)**2
+        loss = relative_l2_error.mean()
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    
-    with torch.no_grad():
-        elapsed_time = time.perf_counter() - prev_time
-        print("Time taken:", elapsed_time)
-        output = model(xy).reshape(im_shape).clamp(0., 255.).detach()
-        print(output)
-        write_png(output.cpu(), reconstructed_file)
-    
-    
-    """
-    model = torch.nn.Sequential(feature_encoding([8, 8]), mlp([4, 4, 4, 4, 4], [1, 1, 1, 1, 1]))
-    print(list(model.parameters()))
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    for i in range(1000):
-        X = torch.Tensor([[3., 3.], [1., 1.]]).to(device='cuda:0')
-        Y = torch.Tensor([[0., 0., 0.], [0.5, 0.5, 0.5]]).to(device='cuda:0')
-        pred = model(X)
-        loss_fn = torch.nn.MSELoss()
-        loss = loss_fn(pred, Y)
-        if i%250 == 0:
-            print(pred)
-            print(loss)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    with torch.no_grad():
-        print(list(model.parameters()))
-    """
-
-
-
-    
-
-
         
 
+        if i % interval == 0 or i == interval_mid:
+            #loss_val = loss.item()
+            torch.cuda.synchronize()
+            
+            elapsed_time = time.perf_counter() - prev_time
+            print(f"Step#{i}: loss={0} time={int(elapsed_time*1000000)}[µs]")
+            prev_time = time.perf_counter()
 
+            """
+            path = f"data/{i}.jpg"
+            print(f"Writing '{path}'... ", end="")
+            
+            with torch.no_grad():
+                write_image(path, model(xy).reshape(img_shape).clamp(0.0, 1.0).detach().cpu().numpy())
+            print("done.")
+
+            # Ignore the time spent saving the image
+            prev_time = time.perf_counter()
+            """
+
+            """
+            if i > 0 and interval < 1000:
+                interval *= 10
+            """
+
+    if result_filename and False:
+        print(f"Writing '{result_filename}'... ", end="")
+        with torch.no_grad():
+            write_image(result_filename, model(xy).reshape(img_shape).clamp(0.0, 1.0).detach().cpu().numpy())
+        print("done.")
